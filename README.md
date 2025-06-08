@@ -92,11 +92,12 @@ import (
     "testing"
 
     "github.com/tidylogic/pgtestkit"
+    "github.com/tidylogic/pgtestkit/example/sql"
 )
 
 func TestWithSQL(t *testing.T) {
-    // Create test DB with default SQL connector
-    dbClient, err := pgtestkit.CreateTestDB(nil)
+    // Create test DB with SQL connector
+    dbClient, err := pgtestkit.CreateTestDB(&sql.SQLConnector{})
     if err != nil {
         t.Fatalf("Failed to create test DB: %v", err)
     }
@@ -158,7 +159,7 @@ func TestMain(m *testing.M) {
 
 ```go
 func TestWithHelper(t *testing.T) {
-    dbClient, err := pgtestkit.CreateTestDB()
+    dbClient, err := pgtestkit.CreateTestDB(&gorm.GORMConnector{})
     if err != nil {
         t.Fatalf("Failed to create test DB: %v", err)
     }
