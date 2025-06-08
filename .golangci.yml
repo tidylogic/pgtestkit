@@ -1,0 +1,76 @@
+version: 2
+
+run:
+  concurrency: 4
+  timeout: 2m
+  issues-exit-code: 1
+  tests: true
+  modules-download-mode: readonly
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  disable-all: false
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errcheck
+    - gocritic
+    - misspell
+    - prealloc
+  
+  disable:
+    - wsl
+    - goconst
+    - lll
+    - gocyclo
+    - gocognit
+
+linters-settings:
+  gocritic:
+    enabled: true
+    enabled-tags:
+      - performance
+      - style
+      - experimental
+    disabled-checks:
+      - hugeParam
+      - rangeValCopy
+
+issues:
+  exclude-dirs:
+    - vendor
+    - testdata
+    - third_party
+    - _examples
+    
+  exclude-rules:
+    - path: _test\.go$
+      linters:
+        - gocyclo
+        - gocognit
+  
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+build:
+  tags:
+    - integration
+  build-tags:
+    - integration
+  args: []
+
+cache:
+  enabled: true
+  cache-dir: ".golangci-cache"
+  cache-ttl: 1h
