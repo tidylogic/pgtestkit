@@ -70,28 +70,35 @@ func (e *ExampleConnector) Reset() error {
 	return rows.Err()
 }
 
+func createTestDB() (*sql.DB, *pgtestkit.TestHelper, func(), error) {
+	// 1. 테스트 DB 클라이언트 생성
+	dbClient, err := pgtestkit.CreateTestDB(&ExampleConnector{})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create test DB: %w", err)
+	}
+
+	// 테스트 헬퍼 생성
+	helper := pgtestkit.NewTestHelper(dbClient)
+
+	// 데이터베이스 클라이언트 가져오기
+	db, ok := dbClient.Client.(*sql.DB)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("expected *sql.DB client")
+	}
+
+	return db, helper, func() {
+		_ = helper.Close()
+		_ = dbClient.Close()
+	}, nil
+}
+
 func TestExample(t *testing.T) {
 	t.Run("Database operations", func(t *testing.T) {
-		// 1. 테스트 DB 클라이언트 생성
-		dbClient, err := pgtestkit.CreateTestDB(&ExampleConnector{})
+		db, helper, cleanup, err := createTestDB()
 		if err != nil {
 			t.Fatalf("Failed to create test DB: %v", err)
 		}
-		defer func() {
-			_ = dbClient.Close() // 에러 무시 (테스트 종료 시)
-		}()
-
-		// 테스트 헬퍼 생성
-		helper := pgtestkit.NewTestHelper(dbClient)
-		defer func() {
-			_ = helper.Close() // 에러 무시 (테스트 종료 시)
-		}()
-
-		// 데이터베이스 클라이언트 가져오기
-		db, ok := dbClient.Client.(*sql.DB)
-		if !ok {
-			t.Fatal("Expected *sql.DB client")
-		}
+		defer cleanup()
 
 		t.Run("Test database operations", func(t *testing.T) {
 			// 테이블 초기화

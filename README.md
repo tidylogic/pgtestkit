@@ -22,8 +22,7 @@ A lightweight PostgreSQL database management tool for Go testing. It helps you e
 - **Fast Test Execution**: Reuses embedded server for faster test runs
 - **Complete Isolation**: Ensures database isolation between tests
 - **Flexible Architecture**: Interface-based design works with any ORM or driver
-- **GORM Support**: Built-in GORM connector (see example/gorm)
-- **database/sql Support**: Fully compatible with the standard library
+- **Flexible Database Connection**: Compatible with various database clients through the DBConnector interface
 
 ## Code Quality
 
@@ -70,19 +69,26 @@ make all
 go get github.com/tidylogic/pgtestkit
 ```
 
-### Using with GORM
+### Implementing DBConnector
 
-To use with GORM, reference the `example/gorm` package:
+You can use any database client by implementing the `DBConnector` interface:
 
-```bash
-go get github.com/tidylogic/pgtestkit/example/gorm@latest
+```go
+type DBConnector interface {
+    // Connect connects to the database and returns the ORM client and SQL DB
+    Connect(connString string) (interface{}, error)
+    // Close closes the database connection
+    Close() error
+    // Reset resets the database to its initial state
+    Reset() error
+}
 ```
 
-See the [example/gorm](example/gorm) directory for detailed examples.
+See the [example](example) directory for implementation examples.
 
 ## Quick Start
 
-### Basic Usage (database/sql)
+### Basic Usage
 
 ```go
 package yourpackage_test
