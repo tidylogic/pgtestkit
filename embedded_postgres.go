@@ -90,34 +90,34 @@ func StartEmbeddedPostgres(dbConfig *embeddedpostgres.Config) error {
 		port = p
 		logger.Info("PostgreSQL server started", zap.Uint32("port", port))
 
-		// 기본 데이터베이스에 연결
-		db, err := sql.Open("pgx", getConnectionString(DefaultDB))
+		// 기본 데이터베이스에 연결 (재시도 로직 포함)
+		db, err := connectToBaseDB(logger)
 		if err != nil {
-			logError("Failed to connect to database", err,
-				zap.String("database", DefaultDB),
-				zap.Uint32("port", port))
 			if stopErr := pg.Stop(); stopErr != nil {
 				logError("Failed to stop PostgreSQL server after connection error", stopErr)
 			}
-			startErr = fmt.Errorf("failed to connect to database: %w", err)
-			return
-		}
-
-		if err := db.Ping(); err != nil {
-			logError("Failed to ping database", err)
-			if closeErr := db.Close(); closeErr != nil {
-				logError("Failed to close database connection", closeErr)
-			}
-			if stopErr := pg.Stop(); stopErr != nil {
-				logError("Failed to stop PostgreSQL server after ping error", stopErr)
-			}
-			startErr = fmt.Errorf("failed to ping database: %w", err)
+			startErr = err
 			return
 		}
 
 		baseDBClient = db
 		serverStarted = true
 		logger.Info("Successfully connected to PostgreSQL server")
+
+		// PostgreSQL이 완전히 준비될 때까지 대기
+		if err := waitForPostgresToBeReady(db, logger); err != nil {
+			logError("PostgreSQL server is not fully ready", err)
+			if closeErr := db.Close(); closeErr != nil {
+				logError("Failed to close database connection", closeErr)
+			}
+			if stopErr := pg.Stop(); stopErr != nil {
+				logError("Failed to stop PostgreSQL server after readiness check error", stopErr)
+			}
+			startErr = fmt.Errorf("postgres server not ready: %w", err)
+			return
+		}
+
+		logger.Info("PostgreSQL server is fully ready for connections")
 
 		// SIGINT, SIGTERM 시그널 처리
 		c := make(chan os.Signal, 1)
@@ -249,6 +249,96 @@ func startPostgresServer(dbConfig *embeddedpostgres.Config) (*embeddedpostgres.E
 	return pg, uint32(freePort), nil
 }
 
+// connectToBaseDB 기본 데이터베이스에 연결합니다 (재시도 로직 포함).
+func connectToBaseDB(logger *zap.Logger) (*sql.DB, error) {
+	maxRetries := 10
+	baseDelay := 100 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		db, err := sql.Open("pgx", getConnectionString(DefaultDB))
+		if err != nil {
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("failed to open database connection after %d attempts: %w", maxRetries, err)
+			}
+
+			delay := time.Duration(attempt) * baseDelay
+			logger.Debug("Database connection open failed, retrying",
+				zap.Int("attempt", attempt),
+				zap.Duration("delay", delay),
+				zap.Error(err))
+			time.Sleep(delay)
+			continue
+		}
+
+		// 연결 테스트
+		if err := db.Ping(); err != nil {
+			db.Close()
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("failed to ping database after %d attempts: %w", maxRetries, err)
+			}
+
+			delay := time.Duration(attempt) * baseDelay
+			logger.Debug("Database ping failed, retrying",
+				zap.Int("attempt", attempt),
+				zap.Duration("delay", delay),
+				zap.Error(err))
+			time.Sleep(delay)
+			continue
+		}
+
+		logger.Info("Successfully connected to base database", zap.Int("attempt", attempt))
+		return db, nil
+	}
+
+	return nil, fmt.Errorf("unexpected error in base database connection loop")
+}
+
+// waitForPostgresToBeReady PostgreSQL이 완전히 준비될 때까지 기다립니다.
+func waitForPostgresToBeReady(db *sql.DB, logger *zap.Logger) error {
+	maxRetries := 20
+	baseDelay := 50 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// bigserial 타입이 사용 가능한지 확인
+		var exists bool
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = 'bigserial')").Scan(&exists)
+		if err == nil && exists {
+			logger.Debug("PostgreSQL bigserial type is available", zap.Int("attempt", attempt))
+			return nil
+		}
+
+		// 다른 기본 타입들도 확인
+		err = db.QueryRow("SELECT 1").Scan(&exists)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("postgresql not ready after %d attempts: %w", maxRetries, err)
+			}
+
+			delay := time.Duration(attempt) * baseDelay
+			logger.Debug("PostgreSQL readiness check failed, retrying",
+				zap.Int("attempt", attempt),
+				zap.Duration("delay", delay),
+				zap.Error(err))
+			time.Sleep(delay)
+			continue
+		}
+
+		// bigserial이 아직 없다면 잠시 더 기다림
+		if attempt == maxRetries {
+			logger.Warn("PostgreSQL is responsive but bigserial type not confirmed, proceeding anyway")
+			return nil
+		}
+
+		delay := time.Duration(attempt) * baseDelay
+		logger.Debug("PostgreSQL basic check passed, checking bigserial availability",
+			zap.Int("attempt", attempt),
+			zap.Duration("delay", delay))
+		time.Sleep(delay)
+	}
+
+	return nil
+}
+
 // StopPostgres 임베디드 PostgreSQL 서버를 중지합니다.
 // 이 함수는 스레드 안전하며, 여러 번 호출되어도 안전합니다.
 func StopPostgres() error {
@@ -364,32 +454,63 @@ func createDatabase(dbName string) error {
 		return err
 	}
 
-	// 이미 존재하는 데이터베이스인지 확인
-	var exists bool
-	err := baseDBClient.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbName).Scan(&exists)
-	if err != nil {
-		err = fmt.Errorf("failed to check if database exists: %w", err)
-		logError("Failed to check database existence", err)
-		return err
+	maxRetries := 3
+	baseDelay := 100 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// 이미 존재하는 데이터베이스인지 확인
+		var exists bool
+		err := baseDBClient.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbName).Scan(&exists)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to check if database exists after %d attempts: %w", maxRetries, err)
+			}
+			delay := time.Duration(attempt) * baseDelay
+			logger.Debug("Database existence check failed, retrying",
+				zap.Int("attempt", attempt),
+				zap.Duration("delay", delay),
+				zap.Error(err))
+			time.Sleep(delay)
+			continue
+		}
+
+		if exists {
+			logger.Debug("Database already exists, skipping creation")
+			return nil // 이미 존재하면 생성하지 않음
+		}
+
+		// 데이터베이스 생성
+		logger.Info("Creating new database", zap.Int("attempt", attempt))
+		// 안전하게 식별자를 이스케이프
+		escapedDBName := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
+		createQuery := fmt.Sprintf("CREATE DATABASE %s", escapedDBName)
+		_, err = baseDBClient.Exec(createQuery)
+		if err != nil {
+			// 데이터베이스가 이미 존재한다는 에러인 경우 성공으로 처리
+			if strings.Contains(err.Error(), "already exists") {
+				logger.Debug("Database was created by another process, continuing")
+				return nil
+			}
+
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to create database %s after %d attempts: %w", dbName, maxRetries, err)
+			}
+
+			delay := time.Duration(attempt) * baseDelay
+			logger.Debug("Database creation failed, retrying",
+				zap.Int("attempt", attempt),
+				zap.Duration("delay", delay),
+				zap.Error(err))
+			time.Sleep(delay)
+			continue
+		}
+
+		logger.Info("Successfully created database", zap.Int("attempt", attempt))
+		return nil
 	}
 
-	if exists {
-		logger.Debug("Database already exists, skipping creation")
-		return nil // 이미 존재하면 생성하지 않음
-	}
-
-	// 데이터베이스 생성
-	logger.Info("Creating new database")
-	// 안전하게 식별자를 이스케이프
-	escapedDBName := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
-	createQuery := fmt.Sprintf("CREATE DATABASE %s", escapedDBName)
-	_, err = baseDBClient.Exec(createQuery)
-	if err != nil {
-		return fmt.Errorf("failed to create database %s: %w", dbName, err)
-	}
-
-	return nil
+	return fmt.Errorf("unexpected error in database creation loop")
 }
 
 // dropDatabase는 데이터베이스를 삭제합니다.
@@ -460,7 +581,9 @@ func dropDatabase(dbName string) error {
 
 // generateTestDBName 테스트용 데이터베이스 이름을 생성합니다.
 func generateTestDBName() string {
-	return fmt.Sprintf("%s%d_%d", TestDBPrefix, os.Getpid(), time.Now().UnixNano()%10000)
+	// 더 높은 유니크성을 위해 랜덤 요소 추가
+	return fmt.Sprintf("%s%d_%d_%d", TestDBPrefix, os.Getpid(), time.Now().UnixNano(),
+		(time.Now().UnixNano() % 1000000))
 }
 
 // CreateTestDB 지정된 커넥터를 사용하여 테스트 데이터베이스를 생성합니다.
@@ -496,12 +619,15 @@ func CreateTestDB(connector DBConnector) (*DBClient, error) {
 		return nil, err
 	}
 
+	// 데이터베이스 생성 후 잠시 대기 (parallel 테스트에서 안정성 향상)
+	time.Sleep(100 * time.Millisecond)
+
 	// 데이터베이스 연결 문자열 생성
 	connString := getConnectionString(dbName)
 	logger.Debug("Connecting to test database")
 
-	// 커넥터를 사용하여 데이터베이스에 연결
-	client, err := connector.Connect(connString)
+	// 커넥터를 사용하여 데이터베이스에 연결 (재시도 로직 포함)
+	client, err := connectWithRetry(connector, connString, logger)
 	if err != nil {
 		// 생성된 데이터베이스 정리
 		logger.Error("Failed to connect to test database, cleaning up", zap.Error(err))
@@ -511,9 +637,9 @@ func CreateTestDB(connector DBConnector) (*DBClient, error) {
 		return nil, fmt.Errorf("failed to connect to test database: %w", err)
 	}
 
-	// Reset 호출로 데이터베이스 초기화
+	// Reset 호출로 데이터베이스 초기화 (재시도 로직 포함)
 	logger.Debug("Resetting test database")
-	if err := connector.Reset(); err != nil {
+	if err := resetWithRetry(connector, logger); err != nil {
 		logger.Error("Failed to reset test database, cleaning up", zap.Error(err))
 		if closeErr := connector.Close(); closeErr != nil {
 			logError("Failed to close connector after reset error", closeErr)
@@ -531,6 +657,62 @@ func CreateTestDB(connector DBConnector) (*DBClient, error) {
 		ConnectionString: connString,
 		connector:        connector,
 	}, nil
+}
+
+// connectWithRetry 커넥터 연결을 재시도합니다.
+func connectWithRetry(connector DBConnector, connString string, logger *zap.Logger) (interface{}, error) {
+	maxRetries := 5
+	baseDelay := 50 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		client, err := connector.Connect(connString)
+		if err == nil {
+			return client, nil
+		}
+
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("failed to connect after %d attempts: %w", maxRetries, err)
+		}
+
+		delay := time.Duration(attempt) * baseDelay
+		logger.Debug("Connection attempt failed, retrying",
+			zap.Int("attempt", attempt),
+			zap.Int("max_retries", maxRetries),
+			zap.Duration("delay", delay),
+			zap.Error(err))
+
+		time.Sleep(delay)
+	}
+
+	return nil, fmt.Errorf("unexpected error in connect retry loop")
+}
+
+// resetWithRetry 데이터베이스 리셋을 재시도합니다.
+func resetWithRetry(connector DBConnector, logger *zap.Logger) error {
+	maxRetries := 3
+	baseDelay := 50 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := connector.Reset()
+		if err == nil {
+			return nil
+		}
+
+		if attempt == maxRetries {
+			return fmt.Errorf("failed to reset after %d attempts: %w", maxRetries, err)
+		}
+
+		delay := time.Duration(attempt) * baseDelay
+		logger.Debug("Reset attempt failed, retrying",
+			zap.Int("attempt", attempt),
+			zap.Int("max_retries", maxRetries),
+			zap.Duration("delay", delay),
+			zap.Error(err))
+
+		time.Sleep(delay)
+	}
+
+	return fmt.Errorf("unexpected error in reset retry loop")
 }
 
 // TestHelper 테스트에 유용한 헬퍼 함수들을 제공합니다.
