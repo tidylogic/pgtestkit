@@ -455,7 +455,7 @@ func createDatabase(dbName string) error {
 	}
 
 	maxRetries := 3
-	baseDelay := 100 * time.Millisecond
+	baseDelay := 10 * time.Millisecond
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// 이미 존재하는 데이터베이스인지 확인
@@ -618,9 +618,6 @@ func CreateTestDB(connector DBConnector) (*DBClient, error) {
 		logError("Failed to create test database", err)
 		return nil, err
 	}
-
-	// 데이터베이스 생성 후 잠시 대기 (parallel 테스트에서 안정성 향상)
-	time.Sleep(100 * time.Millisecond)
 
 	// 데이터베이스 연결 문자열 생성
 	connString := getConnectionString(dbName)
