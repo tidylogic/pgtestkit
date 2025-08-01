@@ -1,6 +1,8 @@
 package gorm_test
 
 import (
+	"bytes"
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"testing"
 	"time"
 
@@ -88,6 +90,17 @@ func TestGORMExample(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
+	buf := &bytes.Buffer{}
+
+	config := embeddedpostgres.DefaultConfig().
+		Username(pgtestkit.DefaultUser).
+		Password(pgtestkit.DefaultPassword).
+		Database(pgtestkit.DefaultDB).
+		Version(embeddedpostgres.V13).
+		StartTimeout(10 * time.Second).
+		Logger(buf).
+		Locale(pgtestkit.DefaultLocale)
+
 	// 모든 테스트에 대해 DB 서버 자동 관리
-	pgtestkit.TestMainWrapper(m)
+	pgtestkit.TestMainWrapper(m, &config)
 }

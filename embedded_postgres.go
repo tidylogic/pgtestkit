@@ -20,11 +20,11 @@ import (
 
 const (
 	// 데이터베이스 기본 설정
-	defaultUser     = "postgres"
-	defaultPassword = "postgres"
-	defaultDB       = "postgres"
-	defaultLocale   = "en_US.UTF-8"
-	testDBPrefix    = "testdb_"
+	DefaultUser     = "postgres"
+	DefaultPassword = "postgres"
+	DefaultDB       = "postgres"
+	DefaultLocale   = "en_US.UTF-8"
+	TestDBPrefix    = "testdb_"
 )
 
 var (
@@ -61,7 +61,7 @@ type DBClient struct {
 
 // StartEmbeddedPostgres 임베디드 PostgreSQL 서버를 시작합니다.
 // 이 함수는 스레드 안전하며, 여러 번 호출되어도 서버는 한 번만 시작됩니다.
-func StartEmbeddedPostgres() error {
+func StartEmbeddedPostgres(dbConfig *embeddedpostgres.Config) error {
 	var startErr error
 
 	serverOnce.Do(func() {
@@ -79,7 +79,7 @@ func StartEmbeddedPostgres() error {
 			return
 		}
 
-		pg, p, err := startPostgresServer()
+		pg, p, err := startPostgresServer(dbConfig)
 		if err != nil {
 			logError("Failed to start PostgreSQL server", err)
 			startErr = fmt.Errorf("failed to start postgres server: %w", err)
@@ -91,10 +91,10 @@ func StartEmbeddedPostgres() error {
 		logger.Info("PostgreSQL server started", zap.Uint32("port", port))
 
 		// 기본 데이터베이스에 연결
-		db, err := sql.Open("pgx", getConnectionString(defaultDB))
+		db, err := sql.Open("pgx", getConnectionString(DefaultDB))
 		if err != nil {
 			logError("Failed to connect to database", err,
-				zap.String("database", defaultDB),
+				zap.String("database", DefaultDB),
 				zap.Uint32("port", port))
 			if stopErr := pg.Stop(); stopErr != nil {
 				logError("Failed to stop PostgreSQL server after connection error", stopErr)
@@ -130,11 +130,6 @@ func StartEmbeddedPostgres() error {
 			}
 			os.Exit(0)
 		}()
-
-		// 테스트 종료 시 자동 정리
-		// runtime.SetFinalizer(DefaultClientManager, func(_ *ClientManager) {
-		// 	StopPostgres()
-		// })
 	})
 
 	return startErr
@@ -204,11 +199,11 @@ func (c *DBClient) Close() error {
 // getConnectionString 데이터베이스 연결 문자열을 생성합니다.
 func getConnectionString(dbName string) string {
 	return fmt.Sprintf("postgres://%s:%s@localhost:%d/%s?sslmode=disable&client_encoding=UTF8",
-		defaultUser, defaultPassword, port, dbName)
+		DefaultUser, DefaultPassword, port, dbName)
 }
 
 // startPostgresServer PostgreSQL 서버를 시작합니다.
-func startPostgresServer() (*embeddedpostgres.EmbeddedPostgres, uint32, error) {
+func startPostgresServer(dbConfig *embeddedpostgres.Config) (*embeddedpostgres.EmbeddedPostgres, uint32, error) {
 	freePort, err := freeport.GetFreePort()
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get free port: %w", err)
@@ -219,23 +214,32 @@ func startPostgresServer() (*embeddedpostgres.EmbeddedPostgres, uint32, error) {
 		return nil, 0, fmt.Errorf("failed to get user home directory: %w", err)
 	}
 
-	cacheDirectory = filepath.Join(userHome, ".embedded-postgres-go", fmt.Sprintf(defaultDB+"_%d", freePort))
+	cacheDirectory = filepath.Join(userHome, ".embedded-postgres-go", fmt.Sprintf(DefaultDB+"_%d", freePort))
 
 	// 캐시 디렉토리 생성
 	if err := os.MkdirAll(cacheDirectory, 0o755); err != nil {
 		return nil, 0, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	config := embeddedpostgres.DefaultConfig().
-		Username(defaultUser).
-		Password(defaultPassword).
-		Database(defaultDB).
-		Version(embeddedpostgres.V15).
-		Port(uint32(freePort)).
-		RuntimePath(cacheDirectory).
-		DataPath(filepath.Join(cacheDirectory, "data")).
-		BinariesPath(cacheDirectory).
-		Locale(defaultLocale)
+	var config embeddedpostgres.Config
+	if dbConfig == nil {
+		config = embeddedpostgres.DefaultConfig().
+			Username(DefaultUser).
+			Password(DefaultPassword).
+			Database(DefaultDB).
+			Version(embeddedpostgres.V15).
+			Port(uint32(freePort)).
+			RuntimePath(cacheDirectory).
+			DataPath(filepath.Join(cacheDirectory, "data")).
+			BinariesPath(cacheDirectory).
+			Locale(DefaultLocale)
+	} else {
+		config = *dbConfig
+		config = config.Port(uint32(freePort))
+		config = config.RuntimePath(cacheDirectory)
+		config = config.DataPath(filepath.Join(cacheDirectory, "data"))
+		config = config.BinariesPath(cacheDirectory)
+	}
 
 	pg := embeddedpostgres.NewDatabase(config)
 	if err := pg.Start(); err != nil {
@@ -321,15 +325,15 @@ func StopPostgres() error {
 // 사용 예시:
 //
 //	func TestMain(m *testing.M) {
-//		os.Exit(testing.TestMainWrapper(m))
+//		os.Exit(testing.TestMainWrapper(m, nil))
 //	}
-func TestMainWrapper(m *testing.M) int {
+func TestMainWrapper(m *testing.M, dbConfig *embeddedpostgres.Config) int {
 	logger := getLogger()
 	logger.Info("Starting test execution")
 
 	// 서버 시작
 	logger.Info("Starting embedded PostgreSQL server for tests")
-	if err := StartEmbeddedPostgres(); err != nil {
+	if err := StartEmbeddedPostgres(dbConfig); err != nil {
 		logError("Failed to start embedded PostgreSQL server", err)
 		return 1
 	}
@@ -377,7 +381,10 @@ func createDatabase(dbName string) error {
 
 	// 데이터베이스 생성
 	logger.Info("Creating new database")
-	_, err = baseDBClient.Exec(fmt.Sprintf("CREATE DATABASE %s", dbName))
+	// 안전하게 식별자를 이스케이프
+	escapedDBName := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
+	createQuery := fmt.Sprintf("CREATE DATABASE %s", escapedDBName)
+	_, err = baseDBClient.Exec(createQuery)
 	if err != nil {
 		return fmt.Errorf("failed to create database %s: %w", dbName, err)
 	}
@@ -436,8 +443,8 @@ func dropDatabase(dbName string) error {
 	logger.Info("Dropping database")
 	// 안전하게 식별자를 이스케이프
 	escapedDBName := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
-	_, err = baseDBClient.Exec(
-		`DROP DATABASE IF EXISTS ` + escapedDBName + ` WITH (FORCE)`)
+	dropQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s", escapedDBName)
+	_, err = baseDBClient.Exec(dropQuery)
 
 	if err != nil {
 		err = fmt.Errorf("failed to drop database %s: %w", dbName, err)
@@ -453,7 +460,7 @@ func dropDatabase(dbName string) error {
 
 // generateTestDBName 테스트용 데이터베이스 이름을 생성합니다.
 func generateTestDBName() string {
-	return fmt.Sprintf("%s%d_%d", testDBPrefix, os.Getpid(), time.Now().UnixNano()%10000)
+	return fmt.Sprintf("%s%d_%d", TestDBPrefix, os.Getpid(), time.Now().UnixNano()%10000)
 }
 
 // CreateTestDB 지정된 커넥터를 사용하여 테스트 데이터베이스를 생성합니다.

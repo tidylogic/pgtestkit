@@ -149,5 +149,5 @@ func TestExample(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	// 모든 테스트에 대해 DB 서버 자동 관리
-	os.Exit(pgtestkit.TestMainWrapper(m))
+	os.Exit(pgtestkit.TestMainWrapper(m, nil))
 }
